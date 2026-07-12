@@ -114,7 +114,7 @@ SERVICE_TOKEN=your-token docker compose -f docker/docker-compose.yml up -d --bui
 
 The Compose file uses the unified binary's default listener ports and forwards `SERVICE_TOKEN`, `JWKS_PUBLIC_KEY`, and `LOBE_API_BASE_URL`. To use custom listener ports or timeout values, add the corresponding variables from the table above to the Compose service's `environment` section and update its `ports` mappings when changing `AGENT_PORT` or `DEVICE_PORT`.
 
-The CD workflow publishes a multi-architecture image for linux/amd64 and linux/arm64. By default it is published as `ghcr.io/lobehub/lobehub-gateway:<version>`; repository maintainers can override the destination with the `DOCKER_IMAGE` Actions secret. Stable releases selected as the default version also publish the `latest` tag.
+The CD workflow builds the linux/amd64 image on a self-hosted Linux runner and publishes it as `ghcr.io/zhouguanyang/lobehub-gateway:<version>`. Configure the `GHCR_USERNAME` and `GHCR_TOKEN` Actions secrets with credentials that can write packages under the `zhouguanyang` namespace. Stable releases selected as the default version also publish the `latest` tag.
 
 ## Architecture
 

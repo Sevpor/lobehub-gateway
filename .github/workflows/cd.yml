@@ -24,6 +24,7 @@ concurrency:
 
 env:
   GO_VERSION: "1.26"
+  DOCKER_IMAGE: ghcr.io/zhouguanyang/lobehub-gateway
 
 jobs:
   prepare-release:
@@ -152,39 +153,35 @@ jobs:
     needs:
       - prepare-release
       - create-draft-release
-    runs-on: ubuntu-latest
+    runs-on:
+      - self-hosted
+      - linux
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare-release.outputs.target_sha }}
 
-      - name: Determine registry and image
-        id: registry
-        env:
-          DOCKER_IMAGE: ${{ secrets.DOCKER_IMAGE }}
-        run: ./.github/scripts/release/resolve-docker-image.sh
-
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to registry
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ steps.registry.outputs.registry }}
-          username: ${{ secrets.DOCKER_USERNAME || github.actor }}
-          password: ${{ secrets.DOCKER_PASSWORD || secrets.GITHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_TOKEN }}
 
-      - name: Build and push multi-arch image
+      - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
           push: true
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           tags: |
-            ${{ steps.registry.outputs.image }}:${{ needs.prepare-release.outputs.version }}
-            ${{ needs.prepare-release.outputs.publish_latest == 'true' && format('{0}:latest', steps.registry.outputs.image) || '' }}
+            ${{ env.DOCKER_IMAGE }}:${{ needs.prepare-release.outputs.version }}
+            ${{ needs.prepare-release.outputs.publish_latest == 'true' && format('{0}:latest', env.DOCKER_IMAGE) || '' }}
 
   publish-release:
     name: Publish release

@@ -114,7 +114,7 @@ SERVICE_TOKEN=your-token docker compose -f docker/docker-compose.yml up -d --bui
 
 Compose 文件使用统一二进制的默认监听端口，并透传 `SERVICE_TOKEN`、`JWKS_PUBLIC_KEY` 和 `LOBE_API_BASE_URL`。如需使用自定义监听端口或超时，请在 Compose 服务的 `environment` 中添加上表对应变量；修改 `AGENT_PORT` 或 `DEVICE_PORT` 时还需同步更新 `ports` 映射。
 
-CD 工作流会发布 linux/amd64 和 linux/arm64 多架构镜像。默认地址为 `ghcr.io/lobehub/lobehub-gateway:<version>`；仓库维护者可以通过 Actions secret `DOCKER_IMAGE` 覆盖目标地址。被选为默认版本的稳定 Release 还会发布 `latest` 标签。
+CD 工作流会在自部署 Linux runner 上构建 linux/amd64 镜像，并发布到 `ghcr.io/zhouguanyang/lobehub-gateway:<version>`。请配置具有 `zhouguanyang` 命名空间软件包写入权限的 Actions secrets `GHCR_USERNAME` 和 `GHCR_TOKEN`。被选为默认版本的稳定 Release 还会发布 `latest` 标签。
 
 ## 架构
 
