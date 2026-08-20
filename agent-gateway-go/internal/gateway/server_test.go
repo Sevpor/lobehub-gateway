@@ -127,6 +127,72 @@ func TestWebSocketPushAndResume(t *testing.T) {
 	if resumed["type"] != "agent_event" || resumed["id"] != "2" {
 		t.Fatalf("unexpected resumed event: %+v", resumed)
 	}
+	wsExpectNoMessage(t, ws2, 100*time.Millisecond)
+
+	ws2.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "1", "wantStatus": true})
+	resumed = ws2.readJSON(t)
+	if resumed["type"] != "agent_event" || resumed["id"] != "2" {
+		t.Fatalf("unexpected resumed event with status requested: %+v", resumed)
+	}
+	resumeComplete := ws2.readJSON(t)
+	if resumeComplete["type"] != "resume_complete" || resumeComplete["status"] != "running" {
+		t.Fatalf("unexpected resume_complete: %+v", resumeComplete)
+	}
+}
+
+func TestWebSocketResumeCompleteWithoutBufferedEvents(t *testing.T) {
+	_, ts := testServer()
+	defer ts.Close()
+	postJSON(t, ts.URL+"/api/operations/init", map[string]any{"operationId": "op-resume-empty", "userId": "user-1"}, http.StatusOK)
+
+	ws := dialWebSocket(t, ts.URL, "/ws?operationId=op-resume-empty")
+	defer ws.close()
+	ws.writeJSON(t, map[string]any{"type": "auth", "token": "service-token"})
+	if msg := ws.readJSON(t); msg["type"] != "auth_success" {
+		t.Fatalf("expected auth_success, got %+v", msg)
+	}
+
+	ws.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "", "wantStatus": true})
+	resumeComplete := ws.readJSON(t)
+	if resumeComplete["type"] != "resume_complete" || resumeComplete["status"] != "running" {
+		t.Fatalf("unexpected resume_complete: %+v", resumeComplete)
+	}
+}
+
+// TestWebSocketResumeCompleteSkippedWhenStatusMissing mirrors the upstream
+// AgentOperationDO.handleResume safety contract (LOBE-10443): when the
+// operation has no stored status (e.g. the init/resume race for
+// trigger-started runs, or a freshly created operation that never received
+// /api/operations/init), the gateway MUST NOT synthesize a resume_complete.
+// The opt-in client treats "no resume_complete" as "keep waiting" — live
+// events still stream and heartbeat loss still forces reconnect — which is
+// safe and recoverable. Emitting an out-of-enum placeholder or a guessed
+// terminal status would either break the SessionStatus contract or abort a
+// run that is only just starting.
+func TestWebSocketResumeCompleteSkippedWhenStatusMissing(t *testing.T) {
+	srv, ts := testServer()
+	defer ts.Close()
+	// init lands the userId but we then clear the stored status to simulate
+	// the init/resume race window where a trigger-started run's WS resume
+	// arrives before init has set the status.
+	postJSON(t, ts.URL+"/api/operations/init", map[string]any{"operationId": "op-resume-no-status", "userId": "user-1"}, http.StatusOK)
+	op := srv.getOperation("op-resume-no-status")
+	if op == nil {
+		t.Fatal("expected operation to exist after init")
+	}
+	op.mu.Lock()
+	op.record.Status = ""
+	op.mu.Unlock()
+
+	ws := dialWebSocket(t, ts.URL, "/ws?operationId=op-resume-no-status")
+	defer ws.close()
+	ws.writeJSON(t, map[string]any{"type": "auth", "token": "service-token"})
+	if msg := ws.readJSON(t); msg["type"] != "auth_success" {
+		t.Fatalf("expected auth_success, got %+v", msg)
+	}
+
+	ws.writeJSON(t, map[string]any{"type": "resume", "lastEventId": "", "wantStatus": true})
+	wsExpectNoMessage(t, ws, 200*time.Millisecond)
 }
 
 func TestWebSocketJWTClaimValidation(t *testing.T) {
