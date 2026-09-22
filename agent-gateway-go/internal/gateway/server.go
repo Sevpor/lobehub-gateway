@@ -27,6 +27,8 @@ type Server struct {
 	heartbeatTimeout time.Duration
 	operations       map[string]*operation
 	operationsMu     sync.Mutex
+	v2Connections    map[*hubConnection]struct{}
+	v2Mu             sync.RWMutex
 }
 
 func NewServer(cfg Config) *Server {
@@ -37,6 +39,7 @@ func NewServer(cfg Config) *Server {
 		cleanupDelay:     defaultCleanupDelay,
 		heartbeatTimeout: defaultHeartbeatTimeout,
 		operations:       map[string]*operation{},
+		v2Connections:    map[*hubConnection]struct{}{},
 	}
 }
 
@@ -46,6 +49,7 @@ func (s *Server) Routes() http.Handler {
 		_, _ = w.Write([]byte("OK"))
 	})
 	mux.HandleFunc("GET /ws", s.handleWebSocket)
+	mux.HandleFunc("GET /v2/ws", s.handleV2WebSocket)
 	mux.HandleFunc("/api/admin/", func(w http.ResponseWriter, r *http.Request) {
 		writeText(w, http.StatusNotFound, "404 page not found")
 	})
@@ -180,7 +184,7 @@ func (s *Server) handleInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	op := s.getOrCreateOperation(body.OperationID)
-	op.init(body.OperationID, body.UserID)
+	op.init(body.OperationID, body.UserID, body.Meta)
 	writeJSON(w, http.StatusOK, map[string]any{"success": true})
 }
 

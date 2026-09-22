@@ -19,7 +19,7 @@
 本仓库的协议基准是两份独立参考实现：
 
 - `device-gateway`：`d9df5542f06df6f5555356efa0735f767f0e5ccf`
-- `agent-gateway`：`96a31e038052a8a98e9986223a170d218c253d0f`
+- `agent-gateway`：`aeaf0abc63134974f803eebf4c1851c5e8f7bf37`
 
 对于已经实现的 gateway 服务，对齐目标是兼容这些参考实现暴露的公开 HTTP 路由、WebSocket 消息、请求和响应结构、认证行为、路由语义以及超时行为。同时，Go 版本仍然保持面向自托管的单实例运行时定位。
 

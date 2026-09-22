@@ -8,15 +8,15 @@ The original Cloudflare Worker Agent Gateway remains the reference implementatio
 
 ## Design
 
-- Single gateway instance with in-memory operation, event-buffer, and pending-request state.
+- Single gateway instance with in-memory operation, event-buffer, pending-request, and v2 user-hub state.
 - Platform-neutral HTTP and WebSocket server.
 - No Cloudflare Workers, Durable Objects, Redis, PostgreSQL, or NATS dependency.
-- Compatible `/api/operations/*` REST API and `/ws` WebSocket protocol for LobeHub Server and browsers where practical.
+- Compatible `/api/operations/*` REST API and both `/ws` (v1) and `/v2/ws` (multiplexed) WebSocket protocols for LobeHub Server and browsers where practical.
 
 ## Deliberate trade-offs
 
 - Single process only. The backend `/api/operations/*` calls and the browser WebSocket for the same `operationId` must reach the same instance.
-- Runtime state lives in memory. Operations, buffered events, pending requests, metrics and errors are lost on restart.
+- Runtime state lives in memory. Operations, buffered events, pending requests, v2 subscriptions, metrics and errors are lost on restart. V2 clients reconnect and resubscribe, but events buffered only before a process restart cannot be replayed and must be recovered from LobeHub storage.
 - The admin surface is intentionally not implemented: `/api/admin/*`, `/admin/ws`, `ADMIN_TOKEN`, admin stats / metrics / errors and admin observer WebSockets are all absent.
 - Durable Object storage, alarms and WebSocket hibernation are replaced by in-process maps and timers.
 
@@ -24,6 +24,7 @@ The original Cloudflare Worker Agent Gateway remains the reference implementatio
 
 - `GET /health` returns `OK`
 - `GET /ws?operationId={operationId}` upgrades a browser WebSocket
+- `GET /v2/ws?token={jwt}&clientId={clientId}` upgrades a user-level multiplexed browser WebSocket
 - `POST /api/operations/init`
 - `POST /api/operations/push-event`
 - `POST /api/operations/push-events`
@@ -34,6 +35,16 @@ The original Cloudflare Worker Agent Gateway remains the reference implementatio
 - `GET /api/operations/status?operationId={operationId}`
 
 All `/api/operations/*` endpoints require `Authorization: Bearer <SERVICE_TOKEN>`. The `/ws` endpoint authenticates via the first WebSocket message, which carries either a JWT signed by the LobeHub Server (verified against `JWKS_PUBLIC_KEY`) or the shared service token.
+
+Protocol v2 authenticates during the `/v2/ws` upgrade. `token` is required; `tokenType` defaults to `jwt` and may be `apiKey` when `serverUrl` is also supplied. Authentication failures complete the WebSocket upgrade and immediately close it with code `4401` and reason `auth_expired` or `auth_failed`, allowing browser clients to distinguish refreshable credentials. A successful connection receives:
+
+```json
+{ "type": "ready", "userId": "user-id", "connectionId": "...", "protocol": 2 }
+```
+
+The connection multiplexes operations with `subscribe` and `unsubscribe`. Stream messages carry the subscribed `operationId`; replay ends with `resume_complete`, including `gap: true` when the in-memory buffer no longer contains a contiguous history. `executor: true` marks the subscription that should receive `tool_execute` events; if no executor exists, all subscribers receive them for v1 parity. Client `tool_result`, `tool_confirmation`, `user_input`, and `interrupt` messages must target an operation subscribed on the same connection.
+
+`POST /api/operations/init` accepts optional metadata fields `topicId`, `threadId`, `agentId`, `groupId`, `taskId`, `scope`, `parentOperationId`, `mirrorToOperationId`, and `rootOperationId`. V2 connections receive user-level `op_lifecycle` messages containing this metadata and the precise operation status. Unknown metadata fields are ignored.
 
 ## Configuration
 
@@ -76,7 +87,7 @@ The `enableGatewayMode` lab switch is hidden in the LobeHub UI until `AGENT_GATE
 
 ## Reverse proxy notes
 
-If you put the gateway behind Nginx, Caddy, Traefik or another reverse proxy, WebSocket upgrade support must be enabled for `/ws`. The browser opens a long-lived WebSocket that sends heartbeats while an agent operation is running, so do not set short read/send timeouts on the proxy.
+If you put the gateway behind Nginx, Caddy, Traefik or another reverse proxy, WebSocket upgrade support must be enabled for both `/ws` and `/v2/ws`. The browser opens a long-lived WebSocket that sends heartbeats while agent operations are running, so do not set short read/send timeouts on the proxy.
 
 Subdomain-style Nginx server (gateway on its own hostname):
 

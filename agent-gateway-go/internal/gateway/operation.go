@@ -23,7 +23,13 @@ var inflightEventTypes = map[string]bool{
 	"stream_start": true,
 	"stream_chunk": true,
 	"tool_start":   true,
+	"tool_execute": true,
 	"step_start":   true,
+}
+
+type queuedHubEvent struct {
+	isToolExecute bool
+	payload       json.RawMessage
 }
 
 type pendingConfirmation struct {
@@ -43,6 +49,9 @@ type operation struct {
 	connections  map[*operationConnection]struct{}
 	eventBuffer  []bufferedEvent
 	eventCounter int
+	hubDispatch  bool
+	hubOverflow  bool
+	hubQueue     []queuedHubEvent
 	lastEventAt  time.Time
 	lastEventTyp string
 	mu           sync.RWMutex
@@ -72,16 +81,27 @@ func newOperation(server *Server, operationID string) *operation {
 	}
 }
 
-func (o *operation) init(operationID string, userID string) {
+func (o *operation) init(operationID string, userID string, meta *operationMeta) {
 	o.mu.Lock()
 	o.record.OperationID = operationID
 	o.record.UserID = userID
 	o.record.Status = StatusRunning
+	if meta != nil {
+		o.record.Meta = cloneMeta(meta)
+	}
 	if o.record.CreatedAt.IsZero() {
 		o.record.CreatedAt = time.Now()
 	}
 	o.stopCleanupLocked()
+	connections := make([]*operationConnection, 0, len(o.connections))
+	for conn := range o.connections {
+		connections = append(connections, conn)
+	}
 	o.mu.Unlock()
+	for _, conn := range connections {
+		conn.verifyPendingOwner(userID)
+	}
+	o.server.notifyLifecycle(o, StatusRunning, "")
 }
 
 func (o *operation) register(conn *operationConnection) {
@@ -135,8 +155,11 @@ func (o *operation) pushEvent(event agentStreamEvent) {
 	o.lastEventTyp = event.Type
 	o.scheduleWatchdogLocked()
 	connections := o.authenticatedConnectionsLocked()
+	o.queueHubEventLocked(msg)
 	o.mu.Unlock()
-	broadcast(connections, msg)
+	if event.Type != "message_patch" {
+		broadcast(connections, msg)
+	}
 
 	if event.Type == "agent_runtime_end" {
 		o.handleAgentRuntimeEnd(event)
@@ -149,7 +172,11 @@ func (o *operation) broadcastToolExecute(event agentStreamEvent) {
 	id := o.nextEventIDLocked()
 	msg["id"] = id
 	o.bufferLocked(id, msg)
+	o.lastEventAt = time.Now()
+	o.lastEventTyp = event.Type
+	o.scheduleWatchdogLocked()
 	connections := o.authenticatedConnectionsLocked()
+	o.queueHubEventLocked(msg)
 	o.mu.Unlock()
 	broadcast(connections, msg)
 }
@@ -174,9 +201,11 @@ func (o *operation) handleSessionEnd(status SessionStatus, summary string) {
 	msg["id"] = id
 	o.bufferLocked(id, msg)
 	connections := o.authenticatedConnectionsLocked()
+	o.queueHubEventLocked(msg)
 	o.scheduleCleanupLocked()
 	o.mu.Unlock()
 	broadcast(connections, msg)
+	o.server.notifyLifecycle(o, status, summary)
 }
 
 func (o *operation) updateStatus(status SessionStatus, summary string) {
@@ -190,12 +219,17 @@ func (o *operation) updateStatus(status SessionStatus, summary string) {
 		msg = map[string]any{"id": id, "status": status, "type": "status_change"}
 	}
 	o.bufferLocked(id, msg)
+	o.queueHubEventLocked(msg)
+	o.lastEventAt = time.Now()
+	o.lastEventTyp = "status_change"
+	o.scheduleWatchdogLocked()
 	connections := o.authenticatedConnectionsLocked()
 	if isTerminalStatus(status) {
 		o.scheduleCleanupLocked()
 	}
 	o.mu.Unlock()
 	broadcast(connections, msg)
+	o.server.notifyLifecycle(o, status, summary)
 }
 
 func (o *operation) requestConfirmation(toolCallID string, tool toolCallInfo, timeout time.Duration) (bool, bool) {
@@ -208,6 +242,7 @@ func (o *operation) requestConfirmation(toolCallID string, tool toolCallInfo, ti
 	o.bufferLocked(id, msg)
 	o.pendingConf[toolCallID] = pendingConfirmation{ch: ch, timer: timer}
 	connections := o.authenticatedConnectionsLocked()
+	o.queueHubEventLocked(msg)
 	o.mu.Unlock()
 	broadcast(connections, msg)
 
@@ -233,6 +268,7 @@ func (o *operation) requestInput(prompt string, timeout time.Duration) (string, 
 	o.bufferLocked(id, msg)
 	o.pendingInput[requestID] = pendingInput{ch: ch, timer: timer}
 	connections := o.authenticatedConnectionsLocked()
+	o.queueHubEventLocked(msg)
 	o.mu.Unlock()
 	broadcast(connections, msg)
 
@@ -278,22 +314,7 @@ func (o *operation) resolveInput(requestID string, content string) {
 }
 
 func (o *operation) handleResume(conn *operationConnection, lastEventID string, wantStatus bool) {
-	o.mu.RLock()
-	idx := -1
-	for i, event := range o.eventBuffer {
-		if event.ID == lastEventID {
-			idx = i
-			break
-		}
-	}
-	missed := o.eventBuffer
-	if idx != -1 {
-		missed = o.eventBuffer[idx+1:]
-	}
-	payloads := make([]json.RawMessage, 0, len(missed))
-	for _, event := range missed {
-		payloads = append(payloads, append(json.RawMessage(nil), event.Data...))
-	}
+	payloads, gap, status := o.collectReplay(lastEventID)
 	// Mirror upstream AgentOperationDO.handleResume: only confirm a status we
 	// actually hold. A missing status can mean "init hasn't landed yet" (the
 	// init/resume race) just as much as "already cleaned up" — synthesizing a
@@ -302,16 +323,89 @@ func (o *operation) handleResume(conn *operationConnection, lastEventID string, 
 	// opt-in client treats "no resume_complete" as "keep waiting" — live events
 	// still stream and heartbeat loss still forces reconnect — which is safe
 	// and recoverable. See LOBE-10443.
-	status := o.record.Status
-	o.mu.RUnlock()
 	for _, payload := range payloads {
-		_ = conn.writeRaw(payload)
+		if !isMuxOnlyPayload(payload) {
+			_ = conn.writeRaw(payload)
+		}
 	}
 	if wantStatus && status != "" {
 		_ = conn.writeJSON(map[string]any{
+			"gap":    gap,
 			"status": status,
 			"type":   "resume_complete",
 		})
+	}
+}
+
+func (o *operation) collectReplay(lastEventID string) ([]json.RawMessage, bool, SessionStatus) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	since := parseEventID(lastEventID)
+	payloads := make([]json.RawMessage, 0, len(o.eventBuffer))
+	for _, event := range o.eventBuffer {
+		if parseEventID(event.ID) > since {
+			payloads = append(payloads, append(json.RawMessage(nil), event.Data...))
+		}
+	}
+	gap := o.eventCounter > since
+	if len(o.eventBuffer) > 0 {
+		gap = parseEventID(o.eventBuffer[0].ID) > since+1
+	}
+	return payloads, gap, o.record.Status
+}
+
+func (o *operation) hubSnapshot() (string, SessionStatus, *operationMeta) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.record.UserID, o.record.Status, cloneMeta(o.record.Meta)
+}
+
+func (o *operation) queueHubEventLocked(msg map[string]any) {
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	isToolExecute := false
+	if event, ok := msg["event"].(agentStreamEvent); ok {
+		isToolExecute = event.Type == "tool_execute"
+	}
+	if len(o.hubQueue) >= eventBufferMax {
+		// A subscriber that cannot keep up must reconnect and replay from the
+		// bounded operation buffer. Keeping an unbounded delivery queue here
+		// would let one stalled socket consume memory indefinitely.
+		o.hubQueue = nil
+		o.hubOverflow = true
+	}
+	o.hubQueue = append(o.hubQueue, queuedHubEvent{isToolExecute: isToolExecute, payload: payload})
+	if o.hubDispatch {
+		return
+	}
+	o.hubDispatch = true
+	go o.drainHubEvents()
+}
+
+func (o *operation) drainHubEvents() {
+	for {
+		o.mu.Lock()
+		if o.hubOverflow {
+			o.hubOverflow = false
+			o.hubQueue = nil
+			operationID := o.record.OperationID
+			o.mu.Unlock()
+			o.server.closeOperationHubSubscribers(operationID)
+			continue
+		}
+		if len(o.hubQueue) == 0 {
+			o.hubQueue = nil
+			o.hubDispatch = false
+			o.mu.Unlock()
+			return
+		}
+		event := o.hubQueue[0]
+		o.hubQueue[0] = queuedHubEvent{}
+		o.hubQueue = o.hubQueue[1:]
+		o.mu.Unlock()
+		o.server.deliverOperationEvent(o, event.payload, event.isToolExecute)
 	}
 }
 
@@ -400,20 +494,26 @@ func (o *operation) fireWatchdog() {
 		o.mu.Unlock()
 		return
 	}
+	summary := watchdogSummary(idle)
 	id := o.nextEventIDLocked()
 	var msg map[string]any
+	var status SessionStatus
 	if abandoned {
-		o.record.Status = StatusError
+		status = StatusError
+		o.record.Status = status
 		msg = map[string]any{"id": id, "status": StatusError, "type": "status_change"}
 	} else {
-		o.record.Status = StatusCompleted
-		msg = map[string]any{"id": id, "summary": watchdogSummary(idle), "type": "session_complete"}
+		status = StatusCompleted
+		o.record.Status = status
+		msg = map[string]any{"id": id, "summary": summary, "type": "session_complete"}
 	}
 	o.bufferLocked(id, msg)
 	connections := o.authenticatedConnectionsLocked()
+	o.queueHubEventLocked(msg)
 	o.scheduleCleanupLocked()
 	o.mu.Unlock()
 	broadcast(connections, msg)
+	o.server.notifyLifecycle(o, status, summary)
 }
 
 func (o *operation) callFinalizeAbandoned(operationID string, reason string) (finalizeAbandonedResult, bool) {
@@ -454,12 +554,8 @@ func watchdogSummary(idle time.Duration) string {
 }
 
 func (o *operation) forwardToolResult(msg toolResultMessage) {
-	body, _ := json.Marshal(map[string]any{
-		"content":    msg.Content,
-		"error":      jsonRawOrNil(msg.Error),
-		"success":    msg.Success,
-		"toolCallId": msg.ToolCallID,
-	})
+	msg.Type = ""
+	body, _ := json.Marshal(msg)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, normalizeBaseURL(o.server.cfg.LobeAPIBaseURL)+"/api/agent/tool-result", bytes.NewReader(body))
@@ -496,6 +592,7 @@ func (o *operation) cleanup() {
 	o.stopCleanupLocked()
 	operationID := o.record.OperationID
 	o.mu.Unlock()
+	o.server.notifyLifecycle(o, "gone", "")
 	for _, conn := range connections {
 		conn.close(wsCloseNormal, "Session expired")
 	}
@@ -549,13 +646,25 @@ func (c *operationConnection) isAdmin() bool {
 	return c.att.IsAdmin
 }
 
-func (c *operationConnection) markAuthenticated(userID string, isAdmin bool) {
+func (c *operationConnection) markAuthenticated(userID string, isAdmin bool, pendingOwner bool) {
 	c.mu.Lock()
 	c.att.Authenticated = true
 	c.att.IsAdmin = isAdmin
 	c.att.LastHeartbeat = time.Now().UnixMilli()
+	c.att.PendingOwner = pendingOwner
 	c.att.UserID = userID
 	c.mu.Unlock()
+}
+
+func (o *operation) authenticateConnection(c *operationConnection, userID string) error {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	storedUserID := o.record.UserID
+	if storedUserID != "" && storedUserID != userID {
+		return errors.New("userId mismatch")
+	}
+	c.markAuthenticated(userID, false, storedUserID == "")
+	return nil
 }
 
 func (c *operationConnection) recordHeartbeat() {
@@ -651,8 +760,8 @@ func (c *operationConnection) handleAuth(payload []byte) {
 	}
 	storedUserID := c.operation.storedUserID()
 	verifiedUserID, err := c.operation.server.auth.resolve(context.Background(), storedUserID, msg)
-	if err == nil && storedUserID != "" && verifiedUserID != storedUserID {
-		err = errors.New("userId mismatch")
+	if err == nil {
+		err = c.operation.authenticateConnection(c, verifiedUserID)
 	}
 	if err != nil {
 		if errors.Is(err, errTokenExpired) {
@@ -667,9 +776,24 @@ func (c *operationConnection) handleAuth(payload []byte) {
 	if c.authTimer != nil {
 		c.authTimer.Stop()
 	}
-	c.markAuthenticated(verifiedUserID, false)
 	_ = c.writeJSON(map[string]string{"type": "auth_success"})
 	c.startHeartbeatTimer(c.operation.server.heartbeatTimeout)
+}
+
+func (c *operationConnection) verifyPendingOwner(userID string) {
+	c.mu.Lock()
+	if !c.att.PendingOwner {
+		c.mu.Unlock()
+		return
+	}
+	if c.att.UserID == userID {
+		c.att.PendingOwner = false
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Unlock()
+	c.close(wsClosePolicy, "userId mismatch")
+	c.operation.remove(c)
 }
 
 func (c *operationConnection) handleAuthenticatedMessage(messageType string, payload []byte) {
@@ -742,9 +866,26 @@ func mustMarshal(value any) []byte {
 	return payload
 }
 
-func jsonRawOrNil(raw json.RawMessage) any {
-	if len(raw) == 0 {
+func isMuxOnlyPayload(payload json.RawMessage) bool {
+	var message struct {
+		Event *struct {
+			Type string `json:"type"`
+		} `json:"event"`
+		Type string `json:"type"`
+	}
+	return json.Unmarshal(payload, &message) == nil && message.Type == "agent_event" && message.Event != nil && message.Event.Type == "message_patch"
+}
+
+func parseEventID(value string) int {
+	var parsed int
+	_, _ = fmt.Sscanf(value, "%d", &parsed)
+	return parsed
+}
+
+func cloneMeta(meta *operationMeta) *operationMeta {
+	if meta == nil {
 		return nil
 	}
-	return raw
+	cloned := *meta
+	return &cloned
 }

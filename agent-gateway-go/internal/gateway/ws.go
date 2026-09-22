@@ -23,6 +23,7 @@ const (
 	wsCloseNormal  = 1000
 	wsClosePolicy  = 1008
 	wsCloseError   = 1011
+	wsCloseAuth    = 4401
 	wsGUID         = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 )
 

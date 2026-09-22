@@ -8,15 +8,15 @@
 
 ## 设计
 
-- 单网关实例，operation、事件缓冲、pending 请求等状态保存在内存中。
+- 单网关实例，operation、事件缓冲、pending 请求和 v2 user hub 状态保存在内存中。
 - 平台无关的 HTTP 与 WebSocket 服务。
 - 不依赖 Cloudflare Workers、Durable Objects、Redis、PostgreSQL 或 NATS。
-- 在可行范围内保持面向 LobeHub Server 和浏览器的 `/api/operations/*` REST API 与 `/ws` WebSocket 协议兼容。
+- 在可行范围内保持面向 LobeHub Server 和浏览器的 `/api/operations/*` REST API、`/ws`（v1）与 `/v2/ws`（多路复用）WebSocket 协议兼容。
 
 ## 明确取舍
 
 - 只支持单进程。相同 `operationId` 的后端 `/api/operations/*` 请求和浏览器 WebSocket 必须到达同一个实例。
-- 运行时状态保存在内存中。重启后 operation、事件缓冲、pending 请求、metrics 和 errors 都会丢失。
+- 运行时状态保存在内存中。重启后 operation、事件缓冲、pending 请求、v2 订阅、metrics 和 errors 都会丢失。v2 客户端会重新连接并订阅，但进程重启前仅存在于缓冲区的事件无法重放，需从 LobeHub 存储恢复。
 - 不实现 admin 模块。包括 `/api/admin/*`、`/admin/ws`、`ADMIN_TOKEN`、admin stats、admin metrics、admin errors 和 admin observer WebSocket。
 - Durable Object storage、alarm 和 WebSocket hibernation 使用进程内 map 与 timer 替代。
 
@@ -24,6 +24,7 @@
 
 - `GET /health` 返回 `OK`
 - `GET /ws?operationId={operationId}` 升级为浏览器 WebSocket 连接
+- `GET /v2/ws?token={jwt}&clientId={clientId}` 升级为用户级多路复用 WebSocket 连接
 - `POST /api/operations/init`
 - `POST /api/operations/push-event`
 - `POST /api/operations/push-events`
@@ -34,6 +35,16 @@
 - `GET /api/operations/status?operationId={operationId}`
 
 所有 `/api/operations/*` 接口都要求 `Authorization: Bearer <SERVICE_TOKEN>`。`/ws` 通过首条 WebSocket 消息认证，消息可携带 LobeHub Server 签发的 JWT（用 `JWKS_PUBLIC_KEY` 校验），或携带共享的 service token。
+
+v2 协议在 `/v2/ws` upgrade 时完成认证。`token` 必填；`tokenType` 默认为 `jwt`，也可设为 `apiKey`，此时还必须提供 `serverUrl`。认证失败时仍先完成 WebSocket upgrade，再立即以 `4401` 和 `auth_expired` 或 `auth_failed` 原因关闭，使浏览器客户端可以判断是否刷新凭据。连接成功后首先收到：
+
+```json
+{ "type": "ready", "userId": "user-id", "connectionId": "...", "protocol": 2 }
+```
+
+同一连接通过 `subscribe` 和 `unsubscribe` 复用多个 operation。流消息携带所订阅的 `operationId`；重放以 `resume_complete` 结束，当内存缓冲区无法提供连续历史时返回 `gap: true`。`executor: true` 表示该订阅负责接收 `tool_execute`；如果没有 executor，则为兼容 v1 而向所有订阅者发送。客户端发出的 `tool_result`、`tool_confirmation`、`user_input` 和 `interrupt` 必须指向同一连接已经订阅的 operation。
+
+`POST /api/operations/init` 可携带 `topicId`、`threadId`、`agentId`、`groupId`、`taskId`、`scope`、`parentOperationId`、`mirrorToOperationId` 和 `rootOperationId` 元数据。v2 连接会收到用户级 `op_lifecycle` 消息，其中包含这些元数据与 operation 的精确状态。未知元数据字段会被忽略。
 
 ## 配置
 
@@ -76,7 +87,7 @@ AGENT_GATEWAY_SERVICE_TOKEN=dev-secret
 
 ## 反向代理说明
 
-如果将 gateway 放在 Nginx、Caddy、Traefik 或其他反向代理后面,必须为 `/ws` 启用 WebSocket upgrade 支持。浏览器在 agent operation 进行期间会保持一条带心跳的长连接,因此不要在代理上设置过短的读写超时。
+如果将 gateway 放在 Nginx、Caddy、Traefik 或其他反向代理后面,必须为 `/ws` 和 `/v2/ws` 启用 WebSocket upgrade 支持。浏览器在 agent operation 进行期间会保持一条带心跳的长连接,因此不要在代理上设置过短的读写超时。
 
 子域名形式的 Nginx server（网关单独使用一个 hostname）：
 

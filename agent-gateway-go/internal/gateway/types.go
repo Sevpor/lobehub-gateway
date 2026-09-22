@@ -28,7 +28,20 @@ type clientAttachment struct {
 	ConnectedAt   int64
 	IsAdmin       bool
 	LastHeartbeat int64
+	PendingOwner  bool
 	UserID        string
+}
+
+type operationMeta struct {
+	AgentID             string `json:"agentId,omitempty"`
+	GroupID             string `json:"groupId,omitempty"`
+	MirrorToOperationID string `json:"mirrorToOperationId,omitempty"`
+	ParentOperationID   string `json:"parentOperationId,omitempty"`
+	RootOperationID     string `json:"rootOperationId,omitempty"`
+	Scope               string `json:"scope,omitempty"`
+	TaskID              string `json:"taskId,omitempty"`
+	ThreadID            string `json:"threadId,omitempty"`
+	TopicID             string `json:"topicId,omitempty"`
 }
 
 type agentStreamEvent struct {
@@ -57,6 +70,7 @@ type operationHTTPBody struct {
 	Event       *agentStreamEvent  `json:"event,omitempty"`
 	Events      []agentStreamEvent `json:"events,omitempty"`
 	Model       string             `json:"model,omitempty"`
+	Meta        *operationMeta     `json:"meta,omitempty"`
 	OperationID string             `json:"operationId,omitempty"`
 	Prompt      string             `json:"prompt,omitempty"`
 	Provider    string             `json:"provider,omitempty"`
@@ -70,17 +84,21 @@ type operationHTTPBody struct {
 
 type operationRecord struct {
 	CreatedAt   time.Time
+	Meta        *operationMeta
 	OperationID string
 	Status      SessionStatus
 	UserID      string
 }
 
 type toolResultMessage struct {
-	Content    *string         `json:"content"`
-	Error      json.RawMessage `json:"error,omitempty"`
-	Success    bool            `json:"success"`
-	ToolCallID string          `json:"toolCallId"`
-	Type       string          `json:"type"`
+	Content          *string         `json:"content"`
+	Error            json.RawMessage `json:"error,omitempty"`
+	ExecutionTimeMS  *int64          `json:"executionTimeMs,omitempty"`
+	State            json.RawMessage `json:"state,omitempty"`
+	Success          bool            `json:"success"`
+	ToolCallID       string          `json:"toolCallId"`
+	Type             string          `json:"type,omitempty"`
+	WorkRegistration json.RawMessage `json:"workRegistration,omitempty"`
 }
 
 type agentRuntimeEndData struct {
